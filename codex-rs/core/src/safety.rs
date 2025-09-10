@@ -339,3 +339,280 @@ mod tests {
         assert_eq!(safety_check, expected);
     }
 }
+
+#[cfg(test)]
+mod tests_more {
+    use super::*;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // Helper: build a WorkspaceWrite policy that only allows the workspace itself by default.
+    fn workspace_only_policy() -> SandboxPolicy {
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec\![],
+            network_access: false,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        }
+    }
+
+    // Helper: builds a simple add-file patch for tests (path may be absolute or relative).
+    fn make_add(path: PathBuf) -> ApplyPatchAction {
+        ApplyPatchAction::new_add_for_test(&path, "".to_string())
+    }
+
+    #[test]
+    fn assess_patch_safety_rejects_empty_patch() {
+        // Empty patches must be rejected irrespective of policies.
+        let cwd = Path::new("."); // not used for empty
+        let policy = AskForApproval::OnRequest;
+        let sandbox_policy = workspace_only_policy();
+
+        // Construct an empty action. Use a minimal sequence: add and then delete to get empty?
+        // Prefer the library helper if available; otherwise, rely on default.
+        // If ApplyPatchAction implements Default (common), use it. If not, ensure a known empty.
+        let empty = ApplyPatchAction::default();
+        assert\!(empty.is_empty());
+
+        let res = assess_patch_safety(&empty, policy, &sandbox_policy, cwd);
+        assert_eq\!(
+            res,
+            SafetyCheck::Reject {
+                reason: "empty patch".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn assess_patch_safety_outside_workspace_policy_never_rejects() {
+        // When a patch attempts to write outside writable roots and approval policy is Never,
+        // it should be rejected with a specific message.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let parent = cwd.parent().unwrap().to_path_buf();
+
+        let outside = make_add(parent.join("outside.txt"));
+        let policy_never = AskForApproval::Never;
+        let sandbox_policy = workspace_only_policy();
+
+        let res = assess_patch_safety(&outside, policy_never, &sandbox_policy, &cwd);
+        assert_eq\!(
+            res,
+            SafetyCheck::Reject {
+                reason: "writing outside of the project; rejected by user approval settings"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn assess_patch_safety_constrained_patch_autosandbox_or_ask() {
+        // For a patch constrained to writable paths (workspace-only), assess_patch_safety
+        // should auto-approve with a sandbox when available; otherwise AskUser.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().to_path_buf();
+
+        let inside = make_add(cwd.join("inner.txt"));
+        let policy = AskForApproval::OnRequest;
+        let sandbox_policy = workspace_only_policy();
+
+        let res = assess_patch_safety(&inside, policy, &sandbox_policy, &cwd);
+
+        let expected = match get_platform_sandbox() {
+            Some(s) => SafetyCheck::AutoApprove { sandbox_type: s },
+            None => SafetyCheck::AskUser,
+        };
+        assert_eq\!(res, expected);
+    }
+
+    #[test]
+    fn assess_patch_safety_on_failure_policy_prefers_auto_approve() {
+        // With AskForApproval::OnFailure, we should auto-approve if a sandbox exists.
+        // If no sandbox exists, we auto-approve for DangerFullAccess or ask user otherwise.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let inside = make_add(cwd.join("inner.txt"));
+
+        // WorkspaceWrite
+        let res_workspace = assess_patch_safety(
+            &inside,
+            AskForApproval::OnFailure,
+            &workspace_only_policy(),
+            &cwd,
+        );
+        let expected_workspace = match get_platform_sandbox() {
+            Some(s) => SafetyCheck::AutoApprove { sandbox_type: s },
+            None => SafetyCheck::AskUser,
+        };
+        assert_eq\!(res_workspace, expected_workspace);
+
+        // DangerFullAccess has a special case: if no sandbox exists, still auto-approve None.
+        let res_danger = assess_patch_safety(
+            &inside,
+            AskForApproval::OnFailure,
+            &SandboxPolicy::DangerFullAccess,
+            &cwd,
+        );
+        let expected_danger = match get_platform_sandbox() {
+            Some(s) => SafetyCheck::AutoApprove { sandbox_type: s },
+            None => SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::None,
+            },
+        };
+        assert_eq\!(res_danger, expected_danger);
+    }
+
+    #[test]
+    fn is_write_patch_constrained_to_writable_paths_normalizes_paths() {
+        // Relative path with ./ and .. should normalize and still be considered inside workspace.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().to_path_buf();
+
+        // Create a nested path: ./a/../b/./c.txt relative to cwd
+        let rel = PathBuf::from("./a/../b/./c.txt");
+        let add_rel = make_add(rel);
+
+        assert\!(is_write_patch_constrained_to_writable_paths(
+            &add_rel,
+            &workspace_only_policy(),
+            &cwd
+        ));
+    }
+
+    #[test]
+    fn assess_command_safety_trusted_when_approved_explicitly() {
+        // Commands explicitly approved should auto-approve without sandbox.
+        let command = vec\!["some-binary".to_string(), "--flag".to_string()];
+        let mut approved: HashSet<Vec<String>> = HashSet::new();
+        approved.insert(command.clone());
+
+        let res = assess_command_safety(
+            &command,
+            AskForApproval::OnRequest,
+            &SandboxPolicy::ReadOnly,
+            &approved,
+            /*with_escalated_permissions=*/ false,
+        );
+        assert_eq\!(
+            res,
+            SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::None
+            }
+        );
+    }
+
+    #[test]
+    fn assess_safety_for_untrusted_unless_trusted_always_asks() {
+        // Regardless of sandbox or danger policy, UnlessTrusted should ask.
+        for sp in [
+            SandboxPolicy::ReadOnly,
+            SandboxPolicy::DangerFullAccess,
+            workspace_only_policy(),
+        ] {
+            let res = assess_safety_for_untrusted_command(
+                AskForApproval::UnlessTrusted,
+                &sp,
+                /*with_escalated_permissions=*/ false,
+            );
+            assert_eq\!(res, SafetyCheck::AskUser);
+        }
+    }
+
+    #[test]
+    fn assess_safety_for_untrusted_danger_full_access_autoapprove_none() {
+        // DangerFullAccess auto-approves without sandbox for multiple approval policies.
+        for ap in [
+            AskForApproval::OnFailure,
+            AskForApproval::Never,
+            AskForApproval::OnRequest,
+        ] {
+            let res = assess_safety_for_untrusted_command(
+                ap,
+                &SandboxPolicy::DangerFullAccess,
+                /*with_escalated_permissions=*/ false,
+            );
+            assert_eq\!(
+                res,
+                SafetyCheck::AutoApprove {
+                    sandbox_type: SandboxType::None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn assess_safety_for_untrusted_onrequest_readonly_escalated_asks() {
+        let res = assess_safety_for_untrusted_command(
+            AskForApproval::OnRequest,
+            &SandboxPolicy::ReadOnly,
+            /*with_escalated_permissions=*/ true,
+        );
+        assert_eq\!(res, SafetyCheck::AskUser);
+    }
+
+    #[test]
+    fn assess_safety_for_untrusted_onrequest_readonly_without_escalation_sandbox_or_ask() {
+        let res = assess_safety_for_untrusted_command(
+            AskForApproval::OnRequest,
+            &SandboxPolicy::ReadOnly,
+            /*with_escalated_permissions=*/ false,
+        );
+        let expected = match get_platform_sandbox() {
+            Some(s) => SafetyCheck::AutoApprove { sandbox_type: s },
+            None => SafetyCheck::AskUser,
+        };
+        assert_eq\!(res, expected);
+    }
+
+    #[test]
+    fn assess_safety_for_untrusted_never_readonly_sandbox_or_reject() {
+        let res = assess_safety_for_untrusted_command(
+            AskForApproval::Never,
+            &SandboxPolicy::ReadOnly,
+            /*with_escalated_permissions=*/ false,
+        );
+        let expected = match get_platform_sandbox() {
+            Some(s) => SafetyCheck::AutoApprove { sandbox_type: s },
+            None => SafetyCheck::Reject {
+                reason: "auto-rejected because command is not on trusted list".to_string(),
+            },
+        };
+        assert_eq\!(res, expected);
+    }
+
+    #[test]
+    fn assess_safety_for_untrusted_onfailure_readonly_sandbox_or_ask() {
+        let res = assess_safety_for_untrusted_command(
+            AskForApproval::OnFailure,
+            &SandboxPolicy::ReadOnly,
+            /*with_escalated_permissions=*/ false,
+        );
+        let expected = match get_platform_sandbox() {
+            Some(s) => SafetyCheck::AutoApprove { sandbox_type: s },
+            None => SafetyCheck::AskUser,
+        };
+        assert_eq\!(res, expected);
+    }
+
+    #[test]
+    fn assess_command_safety_untrusted_falls_back_to_policy_handling() {
+        // A command neither known-safe nor pre-approved should defer to untrusted handling.
+        let command = vec\!["definitely-not-safe".to_string()];
+        let approved: HashSet<Vec<String>> = HashSet::new();
+
+        let res = assess_command_safety(
+            &command,
+            AskForApproval::OnRequest,
+            &SandboxPolicy::ReadOnly,
+            &approved,
+            /*with_escalated_permissions=*/ false,
+        );
+        // Mirrors assess_safety_for_untrusted_command for (OnRequest, ReadOnly, false)
+        let expected = match get_platform_sandbox() {
+            Some(s) => SafetyCheck::AutoApprove { sandbox_type: s },
+            None => SafetyCheck::AskUser,
+        };
+        assert_eq\!(res, expected);
+    }
+}

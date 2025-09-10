@@ -790,3 +790,161 @@ mod tests_windows {
         }
     }
 }
+
+#[cfg(test)]
+mod additional_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn strip_bash_lc_exact_three_items_returns_script() {
+        let cmd: Vec<String> = vec\!["bash", "-lc", "echo hello"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq\!(super::strip_bash_lc(&cmd), Some("echo hello".to_string()));
+    }
+
+    #[test]
+    fn strip_bash_lc_non_matching_shapes_return_none() {
+        let cases: Vec<Vec<&str>> = vec\![
+            vec\!["bash", "-c", "echo"],        // wrong flag
+            vec\!["bash", "-lc"],               // too short
+            vec\!["bash", "-lc", "echo", "x"],  // too long
+            vec\!["zsh", "-lc", "echo"],        // wrong shell
+            vec\!["pwsh", "-lc", "echo"],       // another wrong shell
+        ];
+        for case in cases {
+            let v: Vec<String> = case.into_iter().map(String::from).collect();
+            assert_eq\!(super::strip_bash_lc(&v), None, "unexpected Some for args={v:?}");
+        }
+    }
+
+    #[test]
+    fn shell_name_variants() {
+        let posix = Shell::Posix(PosixShell {
+            shell_path: "/usr/bin/zsh".to_string(),
+            rc_path: "/dev/null".to_string(),
+            shell_snapshot: None,
+        });
+        assert_eq\!(posix.name(), Some("zsh".to_string()));
+
+        let ps = Shell::PowerShell(PowerShellConfig {
+            exe: "pwsh.exe".to_string(),
+            bash_exe_fallback: None,
+        });
+        assert_eq\!(ps.name(), Some("pwsh.exe".to_string()));
+
+        let unknown = Shell::Unknown;
+        assert_eq\!(unknown.name(), None);
+    }
+
+    #[test]
+    fn get_snapshot_returns_clone_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snap.zsh");
+        std::fs::write(&path, "# snapshot").unwrap();
+
+        let original = Arc::new(ShellSnapshot::new(path.clone()));
+        let shell = Shell::Posix(PosixShell {
+            shell_path: "/bin/zsh".to_string(),
+            rc_path: "/dev/null".to_string(),
+            shell_snapshot: Some(original.clone()),
+        });
+
+        let got = shell.get_snapshot().expect("snapshot expected");
+        // Field is pub(crate), accessible within crate tests.
+        assert_eq\!(got.path, path);
+        // We now have three strong refs: original var, inside shell, and got.
+        assert\!(Arc::strong_count(&original) >= 3, "strong_count was {}", Arc::strong_count(&original));
+    }
+
+    #[test]
+    fn unknown_shell_invocation_returns_none() {
+        let shell = Shell::Unknown;
+        let v: Vec<String> = vec\!["echo", "hi"].into_iter().map(String::from).collect();
+        assert_eq\!(shell.format_default_shell_invocation(v), None);
+    }
+
+    #[test]
+    fn shellsnapshot_drop_deletes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("to_delete.zsh");
+        std::fs::write(&path, "# will be deleted on Drop").unwrap();
+        {
+            let _snapshot = ShellSnapshot::new(path.clone());
+            // Drop occurs at end of scope.
+        }
+        assert\!(
+            \!path.exists(),
+            "snapshot file should be deleted on Drop, but still exists at {:?}",
+            path
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_rc_path_with_spaces_is_shell_quoted_and_uses_login_session() {
+        // Ensure rc path contains spaces and special chars to exercise quoting.
+        let tmp = tempfile::tempdir().unwrap();
+        let rc_dir = tmp.path().join("My Profile (Test)");
+        std::fs::create_dir_all(&rc_dir).unwrap();
+        let rc_path = rc_dir.join(".zshrc");
+        std::fs::write(&rc_path, "# test").unwrap();
+
+        let shell = Shell::Posix(PosixShell {
+            shell_path: "/bin/zsh".to_string(),
+            rc_path: rc_path.to_string_lossy().to_string(),
+            shell_snapshot: None,
+        });
+
+        let args = shell
+            .format_default_shell_invocation(vec\!["echo".to_string()])
+            .expect("expected args");
+        assert_eq\!(args.len(), 3);
+        assert_eq\!(args[0], "/bin/zsh");
+        assert_eq\!(args[1], "-lc");
+
+        let rc_cmd = &args[2];
+        let quoted = shlex::try_quote(&rc_path.to_string_lossy()).unwrap();
+        let q = quoted.as_ref();
+        // Accept either "-f" or "- f" as some tests in this file use the latter formatting.
+        assert\!(
+            rc_cmd.contains(&format\!("[ -f {q} ]")) || rc_cmd.contains(&format\!("[ - f {q} ]")),
+            "rc command missing expected quoted rc path: {rc_cmd}"
+        );
+        assert\!(rc_cmd.ends_with("(echo)"), "rc command should end with (echo): {rc_cmd}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_prefers_snapshot_when_present_uses_dash_c() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot_path = tmp.path().join("snapshot.zsh");
+        std::fs::write(&snapshot_path, "# snapshot ready").unwrap();
+
+        let rc_path = tmp.path().join(".zshrc");
+        std::fs::write(&rc_path, "# rc").unwrap();
+
+        let shell = Shell::Posix(PosixShell {
+            shell_path: "/bin/zsh".to_string(),
+            rc_path: rc_path.to_string_lossy().to_string(),
+            shell_snapshot: Some(Arc::new(ShellSnapshot::new(snapshot_path.clone()))),
+        });
+
+        let args = shell
+            .format_default_shell_invocation(vec\!["echo".to_string()])
+            .expect("expected args");
+
+        assert_eq\!(args[0], "/bin/zsh");
+        assert_eq\!(args[1], "-c"); // snapshot present → interactive login not required
+
+        let quoted = shlex::try_quote(&snapshot_path.to_string_lossy()).unwrap();
+        let q = quoted.as_ref();
+        assert\!(
+            args[2].contains(&format\!("[ -f {q} ]")) || args[2].contains(&format\!("[ - f {q} ]")),
+            "rc command should source snapshot path when present: {}",
+            args[2]
+        );
+    }
+}

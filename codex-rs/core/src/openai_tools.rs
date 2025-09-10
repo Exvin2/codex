@@ -1166,3 +1166,174 @@ The shell tool is used to execute shell commands.
         assert_eq!(description, "Runs a shell command and returns its output.");
     }
 }
+
+#[cfg(test)]
+mod streamable_and_schema_extra_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json as j;
+
+    #[test]
+    fn test_get_openai_tools_streamable_shell_includes_exec_and_write_stdin_only() {
+        let model_family = crate::model_family::find_family_for_model("o3").expect("valid model");
+        let config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &model_family,
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            include_plan_tool: false,
+            include_apply_patch_tool: false,
+            include_web_search_request: false,
+            use_streamable_shell_tool: true,
+            include_view_image_tool: false,
+        });
+        let tools = super::get_openai_tools(&config, None);
+
+        // Expect exactly the two streamable function tools, in order.
+        assert_eq\!(tools.len(), 2, "expected only exec_command and write_stdin tools");
+        let names: Vec<String> = tools.iter().map(|t| {
+            match t {
+                OpenAiTool::Function(ResponsesApiTool { name, .. }) => name.clone(),
+                _ => "<non-function>".to_string()
+            }
+        }).collect();
+
+        assert_eq\!(names[0], crate::exec_command::EXEC_COMMAND_TOOL_NAME);
+        assert_eq\!(names[1], crate::exec_command::WRITE_STDIN_TOOL_NAME);
+    }
+
+    #[test]
+    fn test_on_request_does_not_override_streamable_shell() {
+        let model_family = crate::model_family::find_family_for_model("o3").expect("valid model");
+        let config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &model_family,
+            approval_policy: AskForApproval::OnRequest, // would normally select sandbox shell
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            include_plan_tool: false,
+            include_apply_patch_tool: false,
+            include_web_search_request: false,
+            use_streamable_shell_tool: true, // but streamable takes precedence
+            include_view_image_tool: false,
+        });
+        let tools = super::get_openai_tools(&config, None);
+
+        assert_eq\!(tools.len(), 2, "streamable shell should yield two function tools");
+        let names: Vec<String> = tools.iter().filter_map(|t| {
+            if let OpenAiTool::Function(ResponsesApiTool { name, .. }) = t {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }).collect();
+
+        assert_eq\!(names, vec\![
+            crate::exec_command::EXEC_COMMAND_TOOL_NAME.to_string(),
+            crate::exec_command::WRITE_STDIN_TOOL_NAME.to_string()
+        ]);
+    }
+
+    #[test]
+    fn test_sanitize_infers_object_from_properties_and_keeps_properties_map() {
+        let mut v = j\!({
+            "properties": {
+                "k": { "enum": ["a", "b"] }  // will sanitize to type string
+            }
+        });
+        super::sanitize_json_schema(&mut v);
+        assert_eq\!(v.get("type"), Some(&serde_json::Value::String("object".into())));
+        let props = v.get("properties").and_then(|x| x.as_object()).expect("props");
+        assert\!(props.contains_key("k"));
+        assert_eq\!(
+            props["k"].get("type"),
+            Some(&serde_json::Value::String("string".into())),
+            "enum-based property should coerce to string"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_defaults_to_string_when_cannot_infer() {
+        let mut v = j\!({}); // empty schema object
+        super::sanitize_json_schema(&mut v);
+        assert_eq\!(v, j\!({ "type": "string" }));
+    }
+
+    #[test]
+    fn test_sanitize_infers_number_from_minimum() {
+        let mut v = j\!({ "minimum": 0 });
+        super::sanitize_json_schema(&mut v);
+        assert_eq\!(v.get("type"), Some(&serde_json::Value::String("number".into())));
+    }
+
+    #[test]
+    fn test_sanitize_array_without_items_gets_string_items() {
+        let mut v = j\!({ "type": "array" });
+        super::sanitize_json_schema(&mut v);
+        assert_eq\!(
+            v.get("items").and_then(|x| x.get("type")),
+            Some(&serde_json::Value::String("string".into()))
+        );
+    }
+
+    #[test]
+    fn test_sanitize_prefix_items_entries_sanitized() {
+        let mut v = j\!({
+            "type": "array",
+            "prefixItems": [{ "enum": [1, 2] }]
+        });
+        super::sanitize_json_schema(&mut v);
+        let pi = v.get("prefixItems").and_then(|x| x.as_array()).expect("prefixItems");
+        assert_eq\!(
+            pi[0].get("type"),
+            Some(&serde_json::Value::String("string".into())),
+            "enum in prefixItems should sanitize to type string"
+        );
+    }
+
+    #[test]
+    fn test_responses_api_serialization_for_web_search_and_freeform() {
+        let tools = vec\![
+            OpenAiTool::WebSearch { name: "web_search".into() },
+            OpenAiTool::Freeform(FreeformTool {
+                name: "apply_patch".into(),
+                description: "custom edit tool".into(),
+                format: FreeformToolFormat { r#type: "spec".into(), syntax: "yaml".into(), definition: "def".into() }
+            })
+        ];
+        let out = super::create_tools_json_for_responses_api(&tools).expect("ok");
+        assert_eq\!(out.len(), 2);
+
+        assert_eq\!(out[0].get("type"), Some(&serde_json::Value::String("web_search".into())));
+        assert_eq\!(out[0].get("name"), Some(&serde_json::Value::String("web_search".into())));
+
+        assert_eq\!(out[1].get("type"), Some(&serde_json::Value::String("custom".into())));
+        assert_eq\!(out[1].get("name"), Some(&serde_json::Value::String("apply_patch".into())));
+        assert\!(out[1].get("format").is_some(), "custom tool should include format");
+    }
+
+    #[test]
+    fn test_include_apply_patch_freeform_when_flag_true() {
+        let model_family = crate::model_family::find_family_for_model("o3").expect("valid model");
+        let config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &model_family,
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            include_plan_tool: false,
+            include_apply_patch_tool: true,   // request inclusion
+            include_web_search_request: false,
+            use_streamable_shell_tool: false,
+            include_view_image_tool: false,
+        });
+        let tools = super::get_openai_tools(&config, None);
+
+        // Expect at least shell + apply_patch (freeform)
+        assert\!(tools.len() >= 2);
+        let mut found_freeform_apply_patch = false;
+        for t in tools {
+            if let OpenAiTool::Freeform(FreeformTool { name, .. }) = t {
+                if name == "apply_patch" {
+                    found_freeform_apply_patch = true;
+                }
+            }
+        }
+        assert\!(found_freeform_apply_patch, "apply_patch freeform tool should be included when flag is set");
+    }
+}

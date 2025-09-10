@@ -1904,3 +1904,200 @@ mod tests {
         )
     }
 }
+
+#[cfg(test)]
+mod more_tests {
+    // Note: Using Rust’s built-in test harness and insta (already used elsewhere).
+    // These tests avoid external I/O and snapshot non-determinism.
+
+    use super::*;
+
+    fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+    fn render_transcript(cell: &dyn HistoryCell) -> Vec<String> {
+        render_lines(&cell.transcript_lines())
+    }
+
+    #[test]
+    fn title_case_various_inputs() {
+        assert_eq\!(title_case(""), "");
+        assert_eq\!(title_case("hello"), "Hello");
+        assert_eq\!(title_case("HELLO"), "Hello");
+        assert_eq\!(title_case("gPT-4o"), "Gpt-4o");
+        assert_eq\!(title_case("1abc"), "1abc");
+    }
+
+    #[test]
+    fn pretty_provider_name_openai_and_other() {
+        assert_eq\!(pretty_provider_name("openai"), "OpenAI");
+        assert_eq\!(pretty_provider_name("OpEnAi"), "OpenAI");
+        assert_eq\!(pretty_provider_name("anthropic"), "Anthropic");
+    }
+
+    #[test]
+    fn padded_emoji_adds_hair_space() {
+        assert_eq\!(padded_emoji("🌐"), "🌐\u{200A}");
+    }
+
+    #[test]
+    fn spinner_none_returns_first_frame() {
+        let s: Span<'static> = spinner(None);
+        assert_eq\!(s.content.as_ref(), "⠋");
+    }
+
+    #[test]
+    fn exec_into_failed_marks_failure_with_zero_duration() {
+        // start_time None -> into_failed sets duration to 0ms, deterministic
+        let cell = ExecCell::new(ExecCall {
+            call_id: "c1".into(),
+            command: vec\!["echo".into(), "ok".into()],
+            parsed: Vec::new(),
+            output: None,
+            start_time: None,
+            duration: None,
+        });
+        let failed = cell.into_failed();
+        let transcript = render_transcript(&failed);
+        // Expect a line like "✗ (1) • 0ms"
+        assert\!(transcript.iter().any(|l| l.contains("✗ (1) • 0")));
+    }
+
+    #[test]
+    fn exec_should_flush_true_for_completed_command_and_false_for_exploring() {
+        // Non-exploring: parsed empty; completed => should_flush = true
+        let mut cmd_cell = ExecCell::new(ExecCall {
+            call_id: "c1".into(),
+            command: vec\!["echo".into(), "ok".into()],
+            parsed: Vec::new(),
+            output: None,
+            start_time: Some(Instant::now()),
+            duration: None,
+        });
+        cmd_cell.complete_call(
+            "c1",
+            CommandOutput { exit_code: 0, stdout: String::new(), stderr: String::new(), formatted_output: String::new() },
+            Duration::from_millis(1),
+        );
+        assert\!(cmd_cell.should_flush());
+
+        // Exploring: only Read commands; completed => should_flush = false
+        let mut exploring = ExecCell::new(ExecCall {
+            call_id: "r1".into(),
+            command: vec\!["bash".into(), "-lc".into(), "cat a.rs".into()],
+            parsed: vec\![ParsedCommand::Read { name: "a.rs".into(), cmd: "cat a.rs".into() }],
+            output: None,
+            start_time: Some(Instant::now()),
+            duration: None,
+        });
+        exploring.complete_call(
+            "r1",
+            CommandOutput { exit_code: 0, stdout: String::new(), stderr: String::new(), formatted_output: String::new() },
+            Duration::from_millis(1),
+        );
+        assert\!(\!exploring.should_flush());
+    }
+
+    #[test]
+    fn output_lines_only_err_filters_success_and_prefixes_errors() {
+        // Success + only_err => empty
+        let ok = CommandOutput {
+            exit_code: 0,
+            stdout: "out1\nout2\n".into(),
+            stderr: String::new(),
+            formatted_output: String::new(),
+        };
+        let empty = output_lines(Some(&ok), true, true, true);
+        assert\!(empty.is_empty());
+
+        // Failure + only_err => lines with branch "  └ " then "    "
+        let err = CommandOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "e1\ne2\ne3\ne4\ne5\ne6\ne7".into(),
+            formatted_output: String::new(),
+        };
+        let lines = output_lines(Some(&err), true, true, true);
+        let rendered = render_lines(&lines);
+        assert_eq\!(rendered.first().unwrap(), "  └ e1");
+        assert_eq\!(rendered[1], "    e2");
+        assert_eq\!(rendered.last().unwrap(), "    e7");
+        assert_eq\!(rendered.len(), 7);
+    }
+
+    #[test]
+    fn new_web_search_call_renders_emoji_and_query() {
+        let cell = new_web_search_call("rust testing".into());
+        let rendered = render_lines(&cell.display_lines(80));
+        assert_eq\!(rendered, vec\!["🌐\u{200A}rust testing"]);
+    }
+
+    #[test]
+    fn new_proposed_command_contains_header_and_command() {
+        let cell = new_proposed_command(&["echo".into(), "hello".into()]);
+        let lines = cell.display_lines(80);
+        let rendered = render_lines(&lines);
+        assert\!(rendered.iter().any(|l| l.contains("• Proposed Command")));
+        let joined = rendered.join("\n");
+        assert\!(joined.contains("echo"));
+        assert\!(joined.contains("hello"));
+    }
+
+    #[test]
+    fn transcript_only_cell_hides_display_but_keeps_transcript() {
+        let cell = TranscriptOnlyHistoryCell { lines: vec\!["one".into(), "two".into()] };
+        assert\!(cell.display_lines(80).is_empty());
+        assert_eq\!(render_transcript(&cell), vec\!["one", "two"]);
+    }
+
+    #[test]
+    fn exploring_cell_renders_explored_and_read_names() {
+        // Completed exploring calls -> "Explored"
+        let mut cell = ExecCell::new(ExecCall {
+            call_id: "c1".into(),
+            command: vec\!["bash".into(), "-lc".into(), "cat a.rs".into()],
+            parsed: vec\![ParsedCommand::Read { name: "a.rs".into(), cmd: "cat a.rs".into() }],
+            output: None,
+            start_time: Some(Instant::now()),
+            duration: None,
+        });
+        cell.complete_call(
+            "c1",
+            CommandOutput { exit_code: 0, stdout: String::new(), stderr: String::new(), formatted_output: String::new() },
+            Duration::from_millis(1),
+        );
+        let cell = cell
+            .with_added_call(
+                "c2".into(),
+                vec\!["bash".into(), "-lc".into(), "cat b.rs".into()],
+                vec\![ParsedCommand::Read { name: "b.rs".into(), cmd: "cat b.rs".into() }],
+            )
+            .unwrap();
+        let lines = cell.display_lines(80);
+        let rendered = render_lines(&lines).join("\n");
+        assert\!(rendered.starts_with("• Explored"));
+        assert\!(rendered.contains("Read"));
+        assert\!(rendered.contains("a.rs"));
+        assert\!(rendered.contains("b.rs"));
+    }
+
+    #[test]
+    fn error_event_and_stream_error_event_rendering() {
+        let err = new_error_event("oh no".into());
+        let err_line = render_lines(&err.display_lines(80));
+        assert_eq\!(err_line, vec\!["🖐\u{200A} oh no"]);
+
+        let warn = new_stream_error_event("stream warn".into());
+        let warn_line = render_lines(&warn.display_lines(80));
+        // No normal space after emoji; only hair space by design
+        assert_eq\!(warn_line, vec\!["⚠️\u{200A}stream warn"]);
+    }
+}
